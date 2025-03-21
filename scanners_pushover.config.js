@@ -2,7 +2,7 @@ module.exports = {
   apps: [
     {
       name: "scanners-pushover-job",
-      script: "app_local_pushover.js",
+      script: "anal_rc1.js",
       args: "pushover 4",
       // Restart the process at minute 0 every 3 hours (e.g., 00:00, 03:00, 06:00, etc.)
       cron_restart: "0 */3 * * *",
