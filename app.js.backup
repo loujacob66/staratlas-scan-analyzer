@@ -1,0 +1,106 @@
+require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
+const csv = require('csv-parser');
+const { App } = require('@slack/bolt');
+const { getLowestSDUPrice } = require('./sdu_price');
+
+// Mapping fleet names to rental cost values from environment variables
+const rentalPrices = {
+  "planet eater": process.env.RENTAL_PLANET_EATER,
+  "Spacing Guild Scanner 1": process.env.RENTAL_SPACING_GUILD_SCANNER_1,
+  "Atlantic Bluefin Tuna Fleet": process.env.RENTAL_ATLANTIC_BLUEFIN_TUNA_FLEET,
+  "Kangaroo Fleet": process.env.RENTAL_KANGAROO_FLEET,
+};
+
+// If a fleet name contains "lemon" (case-insensitive), it isn’t a rental.
+function getRentalCost(fleet) {
+  if (fleet.toLowerCase().includes("lemon")) {
+    return "N/A";
+  }
+  return rentalPrices[fleet] || "N/A";
+}
+
+// This function reads your CSV log file, aggregates SDU counts for the last 24 hours by fleet,
+// fetches the current lowest SDU price, and returns a condensed message string.
+function analyzeAndFormatMessage(csvFilePath) {
+  return new Promise((resolve, reject) => {
+    let last24HoursByFleet = {};
+    const now = new Date();
+    const twentyFourHoursAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+    fs.createReadStream(csvFilePath)
+      .pipe(csv())
+      .on('data', (row) => {
+        if (!row['Timestamp']) return;
+        let timestamp = new Date(row['Timestamp']);
+        if (isNaN(timestamp)) {
+          try {
+            const formattedTimestamp = row['Timestamp'].replace(/-/g, "/").replace(" ", "T");
+            timestamp = new Date(formattedTimestamp);
+          } catch (e) {
+            return;
+          }
+        }
+        if (isNaN(timestamp)) return;
+        const fleet = row['Fleet Name'] ? row['Fleet Name'].trim() : "Unknown";
+        const sduFound = parseInt(row['SDU Count'], 10) || 0;
+        if (timestamp >= twentyFourHoursAgo) {
+          last24HoursByFleet[fleet] = (last24HoursByFleet[fleet] || 0) + sduFound;
+        }
+      })
+      .on('end', async () => {
+        try {
+          const { price } = await getLowestSDUPrice();
+          if (!price) {
+            return reject("No valid SDU price found.");
+          }
+          const currentPrice = parseFloat(price);
+          const lines = ["SDU Breakdown (Last 24 Hours):"];
+          Object.entries(last24HoursByFleet).forEach(([fleet, count]) => {
+            const value = (count * currentPrice).toFixed(2);
+            const rental = getRentalCost(fleet);
+            lines.push(`• ${fleet}: ${count} SDU | Value: ${value} ATLAS | Rental: ${rental}`);
+          });
+          // Wrap the message in a code block for better monospace formatting in Slack
+          const message = `\`\`\`\n${lines.join("\n")}\n\`\`\``;
+          resolve(message);
+        } catch (err) {
+          reject(err);
+        }
+      })
+      .on('error', (err) => {
+        reject(err);
+      });
+  });
+}
+
+// Initialize the Bolt app with your bot token and signing secret.
+const app = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  port: process.env.PORT || 3000
+});
+
+// Listen for the slash command "/scanners"
+app.command('/scanners', async ({ command, ack, respond }) => {
+  try {
+    await ack();
+    // Determine CSV file path from environment variable or default
+    const csvFilePath = process.env.CSV_FILE_PATH || path.join(__dirname, 'scan_stats.csv');
+    const message = await analyzeAndFormatMessage(csvFilePath);
+    await respond({
+      response_type: "in_channel",
+      text: message
+    });
+  } catch (error) {
+    console.error("Error processing /scanners command:", error);
+    await respond("Sorry, something went wrong while processing your request.");
+  }
+});
+
+// Start the Bolt app
+(async () => {
+  await app.start();
+  console.log(`⚡️ Slack bot is running on port ${process.env.PORT || 3000}!`);
+})();
