@@ -1,19 +1,18 @@
 require('dotenv').config();
 const fs = require('fs');
+const path = require('path');
 const csv = require('csv-parser');
 const axios = require('axios');
 const { getLowestSDUPrice } = require('./sdu_price');
 
 const CSV_FILE_PATH = process.env.CSV_FILE_PATH || "/mnt/star_atlas/scanning/scan_stats.csv";
-const BASES_FILE_PATH = process.env.BASES_FILE_PATH || "./.bases"; // now looks in the local directory
-
-const DEBUG = process.env.DEBUG_BASES === 'true';
 
 // 1. Build rental prices mapping from .env
 function loadRentalPrices() {
   const rentalPrices = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (key.startsWith("RENTAL_")) {
+      // e.g., RENTAL_PLANET_EATER => "planet eater"
       const fleetName = key
         .slice("RENTAL_".length)
         .split('_')
@@ -44,28 +43,8 @@ async function getAtlasUsdPrice() {
   }
 }
 
-// 3. Load bases mapping from the .bases file
-function loadBasesMapping() {
-  const content = fs.readFileSync(BASES_FILE_PATH, 'utf8');
-  const mapping = {};
-  const lines = content.split('\n').filter(line => line.trim());
-  lines.forEach(line => {
-    // Split on one or more whitespace or comma characters.
-    const parts = line.trim().split(/[\s,]+/);
-    if (parts.length >= 2) {
-      const coord = parts[0].trim();
-      const baseName = parts[1].trim();
-      mapping[coord] = baseName;
-    }
-  });
-  if (DEBUG) {
-    console.log("Loaded bases mapping:", mapping);
-  }
-  return mapping;
-}
-
-// 4. Process CSV and reconcile the coordinate using the mapping
-async function processCSV(hours, basesMapping) {
+// 3. Process CSV (Timestamp, Fleet Name, SDU Count)
+async function processCSV(hours) {
   return new Promise((resolve, reject) => {
     const now = new Date();
     const since = new Date(now.getTime() - hours * 60 * 60 * 1000);
@@ -83,68 +62,53 @@ async function processCSV(hours, basesMapping) {
         const sduCount = parseInt(row["SDU Count"], 10) || 0;
 
         if (!fleetData[fleet]) {
-          fleetData[fleet] = { SDUs: 0, SDUs24h: 0, baseName: "" };
+          fleetData[fleet] = { SDUs: 0, SDUs24h: 0 };
         }
-        if (timestamp >= since) fleetData[fleet].SDUs += sduCount;
-        if (timestamp >= last24h) fleetData[fleet].SDUs24h += sduCount;
-
-        // Try to get the coordinate from either "Starbase Coordinate" or "Starbase"
-        let starbaseKey = "";
-        if (row["Starbase Coordinate"] && row["Starbase Coordinate"].trim() !== "") {
-          starbaseKey = row["Starbase Coordinate"].trim();
-        } else if (row["Starbase"] && row["Starbase"].trim() !== "") {
-          starbaseKey = row["Starbase"].trim();
-        }
-        if (starbaseKey !== "") {
-          const baseName = basesMapping[starbaseKey] || "Unknown";
-          if (DEBUG) {
-            console.log(`Row with key "${starbaseKey}" mapped to base name: "${baseName}"`);
-          }
-          fleetData[fleet].baseName = baseName;
-        }
+        if (timestamp >= since) fleetData[fleet].SDUs += sduCount;       // last Xh
+        if (timestamp >= last24h) fleetData[fleet].SDUs24h += sduCount; // 24h
       })
       .on('end', () => resolve(fleetData))
       .on('error', reject);
   });
 }
 
-// 5. Format the fleet table with a new "Base" column that shows the base name,
-// and sort the output alphabetically by base name.
+// 4a. STDOUT: Format the detailed fleet table with aligned columns
 function formatFleetTable(fleetData, hours, price) {
+  // If there's no data, return a warning message
   if (Object.keys(fleetData).length === 0) {
     return `⚠️ No data for the last ${hours} hours.\n`;
   }
-  const headers = ["Fleet", "Base", "SDUs", "Val", "24h SDUs", "24h Val", "Rent", "ROI"];
+
+  // Column headers
+  const headers = ["Fleet", "SDUs", "Val", "24h SDUs", "24h Val", "Rent", "ROI"];
+
+  // Build an array of rows (including the header row)
   const tableRows = [];
+  // First row is the header
   tableRows.push(headers);
 
-  // Convert fleetData to an array and sort by the baseName field alphabetically.
-  const sortedEntries = Object.entries(fleetData).sort((a, b) => {
-    const baseA = a[1].baseName || "";
-    const baseB = b[1].baseName || "";
-    return baseA.localeCompare(baseB);
-  });
-
-  sortedEntries.forEach(([fleet, data]) => {
-    const valDynamic = (data.SDUs * price).toFixed(2);
-    const val24h = (data.SDUs24h * price).toFixed(2);
+  // Add data rows
+  for (const [fleet, data] of Object.entries(fleetData)) {
+    const valDynamic = (data.SDUs * price).toFixed(2);  // last Xh
+    const val24h = (data.SDUs24h * price).toFixed(2);   // 24h
     const rent = getRentalCost(fleet);
     let roi = "N/A";
     if (rent !== "N/A" && !isNaN(parseFloat(rent)) && parseFloat(rent) > 0) {
       roi = ((data.SDUs24h * price) / parseFloat(rent) * 100).toFixed(0) + "%";
     }
+
     tableRows.push([
-      fleet,
-      data.baseName || "",
-      data.SDUs.toString(),
-      valDynamic,
-      data.SDUs24h.toString(),
-      val24h,
-      rent.toString(),
+      fleet,                     // Fleet
+      data.SDUs.toString(),      // SDUs (Xh)
+      valDynamic,                // Val (Xh)
+      data.SDUs24h.toString(),   // 24h SDUs
+      val24h,                    // 24h Val
+      rent.toString(),           // Rent
       roi
     ]);
-  });
+  }
 
+  // Determine column widths
   const colWidths = headers.map((_, colIndex) => {
     let maxWidth = 0;
     tableRows.forEach(row => {
@@ -156,48 +120,50 @@ function formatFleetTable(fleetData, hours, price) {
     return maxWidth;
   });
 
+  // Build the separator row
   const separatorRow = colWidths.map(w => "-".repeat(w)).join("   ");
+
+  // Build final lines
   const lines = [];
   lines.push(`SDU Breakdown (Last ${hours}h):`);
+
   tableRows.forEach((row, rowIndex) => {
     if (rowIndex === 1) {
+      // Insert the separator after the header
       lines.push(separatorRow);
     }
     const line = row.map((cell, i) => cell.padEnd(colWidths[i])).join("   ");
     lines.push(line);
   });
+
   return lines.join("\n");
 }
 
-// Mobile formatting (includes the Base label and sorts by base name)
+// 4b. Mobile (Pushover): bullet format for each rented fleet, minimal
+// Only shows: Fleet Name, ROI, 24h value, last Xh value
 function formatFleetTableMobile(fleetData, hours, price) {
   if (Object.keys(fleetData).length === 0) return `No data for the last ${hours} hours.`;
 
-  // Sort entries by baseName
-  const sortedEntries = Object.entries(fleetData).sort((a, b) => {
-    const baseA = a[1].baseName || "";
-    const baseB = b[1].baseName || "";
-    return baseA.localeCompare(baseB);
-  });
-
   const lines = [`SDU Breakdown (Last ${hours}h):`];
-  sortedEntries.forEach(([fleet, data]) => {
+  for (const [fleet, data] of Object.entries(fleetData)) {
     const rent = getRentalCost(fleet);
-    if (rent === "N/A" || isNaN(parseFloat(rent))) return;
-    const valDynamic = (data.SDUs * price).toFixed(2);
-    const val24h = (data.SDUs24h * price).toFixed(2);
+    // Only show rented fleets
+    if (rent === "N/A" || isNaN(parseFloat(rent))) continue;
+
+    const valDynamic = (data.SDUs * price).toFixed(2);   // last Xh
+    const val24h = (data.SDUs24h * price).toFixed(2);    // 24h
     const roi = ((data.SDUs24h * price) / parseFloat(rent) * 100).toFixed(0) + "%";
-    lines.push(`• ${fleet} (${data.baseName || ""})`);
+
+    lines.push(`• ${fleet}`);
     lines.push(`   ROI:  ${roi}`);
     lines.push(`   24h:  ${val24h} ATLAS`);
     lines.push(`   ${hours}h: ${valDynamic} ATLAS`);
     lines.push("");
-  });
+  }
   return lines.join("\n");
 }
 
-// 6. Format net profit summary (detailed and mobile versions)
-// [Net profit formatting functions remain unchanged]
+// 5a. STDOUT: Format net profit summary table (detailed)
 function formatNetProfitSummary(
   net24h, netDynamic,
   netRented24h, netRentedDynamic,
@@ -244,6 +210,7 @@ function formatNetProfitSummary(
     }
   ];
 
+  // Compute column widths
   const colWidths = headers.map(h => h.length);
   rowsData.forEach(row => {
     headers.forEach((header, i) => {
@@ -252,6 +219,7 @@ function formatNetProfitSummary(
     });
   });
 
+  // Build lines
   const headerRow = headers.map((h, i) => h.padEnd(colWidths[i])).join("   ");
   const separatorRow = colWidths.map(w => "-".repeat(w)).join("   ");
   const dataRows = rowsData.map(row =>
@@ -261,6 +229,7 @@ function formatNetProfitSummary(
   return `Net Profits:\n${headerRow}\n${separatorRow}\n${dataRows.join("\n")}`;
 }
 
+// 5b. Mobile net profit summary: bullet format
 function formatNetProfitSummaryMobile(
   net24h, netDynamic,
   netRented24h, netRentedDynamic,
@@ -289,7 +258,7 @@ function formatNetProfitSummaryMobile(
   return lines.join("\n");
 }
 
-// 7. Combine fleet table and net profit summary; append current SDU price
+// 6. Combine fleet table & net profit summary; append current SDU price
 function buildFinalMessage(
   fleetTableStr,
   net24h, netDynamic,
@@ -323,9 +292,9 @@ function buildFinalMessage(
   return fleetTableStr + "\n\n" + summaryStr + "\n\n" + priceLine;
 }
 
-// 8. Compute net profits and other metrics
-async function analyzeAndFormatLocal(hours = 24, basesMapping) {
-  const fleetData = await processCSV(hours, basesMapping);
+// 7. Compute net profits
+async function analyzeAndFormatLocal(hours = 24) {
+  const fleetData = await processCSV(hours);
   const lowestPriceObj = await getLowestSDUPrice();
   if (!lowestPriceObj || !lowestPriceObj.price) throw new Error("No valid SDU price found.");
   const currentPrice = parseFloat(lowestPriceObj.price);
@@ -338,8 +307,8 @@ async function analyzeAndFormatLocal(hours = 24, basesMapping) {
   let ownedValDynamic = 0, ownedVal24h = 0;
 
   for (const [fleet, data] of Object.entries(fleetData)) {
-    const valDynamic = data.SDUs * currentPrice;
-    const val24h = data.SDUs24h * currentPrice;
+    const valDynamic = data.SDUs * currentPrice;   // last Xh
+    const val24h = data.SDUs24h * currentPrice;    // 24h
     totalValDynamic += valDynamic;
     totalVal24h += val24h;
 
@@ -383,15 +352,12 @@ async function analyzeAndFormatLocal(hours = 24, basesMapping) {
   };
 }
 
-// 9. Main function
+// 8. Main function
 async function main() {
   const args = process.argv.slice(2);
   const usePushover = args[0] === "pushover";
   const hoursArgIndex = usePushover ? 1 : 0;
   const hours = args.length > hoursArgIndex ? parseInt(args[hoursArgIndex], 10) || 24 : 24;
-
-  // Load bases mapping from .bases file
-  const basesMapping = loadBasesMapping();
 
   try {
     const {
@@ -408,12 +374,14 @@ async function main() {
       totalRent24h,
       rentedVal24h,
       rentedRent24h
-    } = await analyzeAndFormatLocal(hours, basesMapping);
+    } = await analyzeAndFormatLocal(hours);
 
+    // Decide table format
     const fleetTableStr = usePushover
-      ? formatFleetTableMobile(fleetData, hours, currentPrice)
-      : formatFleetTable(fleetData, hours, currentPrice);
+      ? formatFleetTableMobile(fleetData, hours, currentPrice)  // minimal bullet version
+      : formatFleetTable(fleetData, hours, currentPrice);       // aligned columns
 
+    // Build final message
     const finalMessage = buildFinalMessage(
       fleetTableStr,
       net24h,
@@ -433,6 +401,7 @@ async function main() {
     );
 
     if (usePushover) {
+      // Pushover
       const pushoverToken = process.env.PUSHOVER_TOKEN;
       const pushoverUser = process.env.PUSHOVER_USER;
       if (!pushoverToken || !pushoverUser) {
@@ -447,6 +416,7 @@ async function main() {
         console.log("Message sent to Pushover.");
       }
     } else {
+      // STDOUT
       console.log(finalMessage);
     }
   } catch (err) {
